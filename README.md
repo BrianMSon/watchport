@@ -2,6 +2,8 @@
 
 A lightweight, real-time port monitoring tool for the terminal. Like `watch netstat`, but with powerful filtering, color-coded output, and a responsive layout.
 
+![WatchPort Screenshot](watchport_screenshot.png)
+
 ## Features
 
 - **Live refresh** with configurable interval
