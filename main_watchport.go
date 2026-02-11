@@ -84,9 +84,9 @@ func calcColWidths(termCols int) colWidths {
 	}
 
 	remaining := termCols - fixedWidth
-	procW := remaining / 4
-	if procW > 30 {
-		procW = 30
+	procW := remaining / 3
+	if procW > 45 {
+		procW = 45
 	}
 	if procW < minProcess {
 		procW = minProcess
