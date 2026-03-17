@@ -27,7 +27,7 @@ archives:
           - zip
 
 checksum:
-  name_template: "checksums.txt"
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
 
 release:
   mode: replace
