@@ -64,11 +64,32 @@ func disableRawInput() {
 	}
 }
 
+// Special key constants
+const (
+	KeyUp    byte = 0x80
+	KeyDown  byte = 0x81
+	KeyLeft  byte = 0x82
+	KeyRight byte = 0x83
+)
+
 func readKey() (byte, bool) {
-	buf := make([]byte, 1)
+	buf := make([]byte, 3)
 	n, err := os.Stdin.Read(buf)
 	if err != nil || n == 0 {
 		return 0, false
+	}
+	// ANSI escape sequence: ESC [ A/B/C/D
+	if n >= 3 && buf[0] == 0x1b && buf[1] == '[' {
+		switch buf[2] {
+		case 'A':
+			return KeyUp, true
+		case 'B':
+			return KeyDown, true
+		case 'C':
+			return KeyRight, true
+		case 'D':
+			return KeyLeft, true
+		}
 	}
 	return buf[0], true
 }
