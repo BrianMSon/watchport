@@ -40,10 +40,13 @@ var prevCols, prevRows int
 var startTime time.Time
 
 var (
-	paused    int32
-	lastConns []PortInfo
-	displayMu sync.Mutex
-	exitOnce  sync.Once
+	paused      int32
+	lastConns   []PortInfo
+	displayMu   sync.Mutex
+	exitOnce    sync.Once
+	selectedIdx int
+	killMsg     string
+	killMsgTime time.Time
 )
 
 // PortInfo 포트 정보 구조체
@@ -73,27 +76,7 @@ type colWidths struct {
 }
 
 func calcColWidths(termCols int) colWidths {
-	// 고정: PROTO(6)+sp(1)+PORT(6)+sp(2)+sp(1)+sp(1)+STATUS(12)+sp(1)+PID(8)+sp(2) = 40
-	const fixedWidth = 40
-	const minLocal = 15
-	const minRemote = 15
-	const minProcess = 10
-
-	if termCols < fixedWidth+minLocal+minRemote+minProcess {
-		termCols = fixedWidth + minLocal + minRemote + minProcess
-	}
-
-	remaining := termCols - fixedWidth
-	procW := remaining / 3
-	if procW > 45 {
-		procW = 45
-	}
-	if procW < minProcess {
-		procW = minProcess
-	}
-	addrW := (remaining - procW) / 2
-
-	return colWidths{local: addrW, remote: addrW, process: procW, total: termCols}
+	return colWidths{total: termCols}
 }
 
 
@@ -517,59 +500,162 @@ func printHeader(portSpec string, interval float64, count int, listenOnly bool, 
 		fmt.Printf("\033[1;36mWatchPort\033[0m | \033[1;32m%d\033[0m\n", count)
 	}
 
-	fmt.Println(strings.Repeat("-", w))
+	fmt.Println(strings.Repeat("-", w-1))
 }
 
-func printTableHeader(cw colWidths) {
-	fmt.Printf("\033[1;37m%-6s %6s  %-*s %-*s %-12s %8s  %-*s\033[0m\n",
-		"PROTO", "PORT", cw.local, "LOCAL ADDRESS", cw.remote, "REMOTE ADDRESS", "STATUS", "PID", cw.process, "PROCESS")
+// connFields 연결 한 행의 필드 데이터
+type connFields struct {
+	fields    []string
+	fieldLens []int
 }
 
-func printConnection(p PortInfo, cw colWidths) {
-	// 로컬 주소
+// buildConnFields 연결의 필드 문자열과 표시 길이를 생성
+func buildConnFields(p PortInfo) connFields {
 	localAddr := fmt.Sprintf("%s:%d", p.LocalAddr, p.LocalPort)
-
-	// 원격 주소
 	remoteAddr := "*:*"
 	if p.RemoteAddr != "" && p.RemotePort > 0 {
 		remoteAddr = fmt.Sprintf("%s:%d", p.RemoteAddr, p.RemotePort)
 	}
 
-	// 프로세스 이름
-	procName := p.ProcessName
-
-	// 프로토콜 색상
-	protoColor := "\033[1;34m" // 파란색 (TCP)
+	protoColor := "\033[1;34m"
 	if p.Protocol == "UDP" {
-		protoColor = "\033[1;35m" // 보라색 (UDP)
+		protoColor = "\033[1;35m"
 	}
+	protoStr := fmt.Sprintf("%s%s\033[0m", protoColor, p.Protocol)
 
-	// 상태 색상
 	statusColor := "\033[0m"
 	switch p.Status {
 	case "LISTENING":
-		statusColor = "\033[1;32m" // 초록색
+		statusColor = "\033[1;32m"
 	case "ESTABLISHED":
-		statusColor = "\033[1;33m" // 노란색
+		statusColor = "\033[1;33m"
 	case "TIME_WAIT", "CLOSE_WAIT":
-		statusColor = "\033[1;31m" // 빨간색
+		statusColor = "\033[1;31m"
 	}
+	statusStr := fmt.Sprintf("%s%s\033[0m", statusColor, p.Status)
 
-	// PID 표시
 	pidStr := "-"
 	if p.PID > 0 {
 		pidStr = fmt.Sprintf("%d", p.PID)
 	}
+	portStr := fmt.Sprintf("%d", p.LocalPort)
 
-	fmt.Printf("%s%-6s\033[0m %6d  %-*s %-*s %s%-12s\033[0m %8s  %-*s\n",
-		protoColor, p.Protocol,
-		p.LocalPort,
-		cw.local, localAddr,
-		cw.remote, remoteAddr,
-		statusColor, p.Status,
-		pidStr,
-		cw.process, procName,
-	)
+	fields := []string{protoStr, portStr, localAddr, remoteAddr, statusStr, pidStr, p.ProcessName}
+	fieldLens := []int{len(p.Protocol), len(portStr), len(localAddr), len(remoteAddr), len(p.Status), len(pidStr), len(p.ProcessName)}
+	return connFields{fields: fields, fieldLens: fieldLens}
+}
+
+// calcMaxConnColWidths 모든 행에서 각 칼럼의 최대 표시 길이 산출 (헤더 포함)
+func calcMaxConnColWidths(rows []connFields) []int {
+	headerNames := []string{"PROTO", "PORT", "LOCALADDR", "REMOTEADDR", "STATUS", "PID", "PROCESS"}
+	maxes := make([]int, len(headerNames))
+	for i, n := range headerNames {
+		maxes[i] = len(n)
+	}
+	for _, r := range rows {
+		for i, l := range r.fieldLens {
+			if l > maxes[i] {
+				maxes[i] = l
+			}
+		}
+	}
+	return maxes
+}
+
+// buildLine 필드들을 균등 간격으로 배치한 행 생성
+func buildLine(fields []string, fieldLens []int, maxW int) string {
+	numGaps := len(fields) - 1
+	if numGaps <= 0 {
+		if len(fields) == 1 {
+			return fields[0]
+		}
+		return ""
+	}
+	contentTotal := 0
+	for _, fl := range fieldLens {
+		contentTotal += fl
+	}
+	totalGap := maxW - contentTotal
+	if totalGap < numGaps {
+		totalGap = numGaps
+	}
+	var sb strings.Builder
+	for i, f := range fields {
+		sb.WriteString(f)
+		if i < numGaps {
+			gap := totalGap / numGaps
+			if i < totalGap%numGaps {
+				gap++
+			}
+			if gap < 1 {
+				gap = 1
+			}
+			for g := 0; g < gap; g++ {
+				sb.WriteByte(' ')
+			}
+		}
+	}
+	return sb.String()
+}
+
+// truncateLine ANSI escape 시퀀스를 제외한 표시 문자 수로 행을 자름
+func truncateLine(s string, maxLen int) string {
+	visible := 0
+	i := 0
+	for i < len(s) {
+		if s[i] == '\033' {
+			j := i + 1
+			for j < len(s) && s[j] != 'm' {
+				j++
+			}
+			if j < len(s) {
+				j++
+			}
+			i = j
+			continue
+		}
+		if visible >= maxLen {
+			return s[:i] + "\033[0m"
+		}
+		visible++
+		i++
+	}
+	return s
+}
+
+// padField 필드를 targetLen까지 공백으로 오른쪽 패딩
+func padField(field string, visibleLen, targetLen int) string {
+	if visibleLen >= targetLen {
+		return field
+	}
+	return field + strings.Repeat(" ", targetLen-visibleLen)
+}
+
+func printTableHeader(colMaxes []int, maxW int) {
+	headerNames := []string{"PROTO", "PORT", "LOCALADDR", "REMOTEADDR", "STATUS", "PID", "PROCESS"}
+	paddedNames := make([]string, len(headerNames))
+	for i, n := range headerNames {
+		paddedNames[i] = padField(n, len(n), colMaxes[i])
+	}
+	line := "\033[1;37m" + buildLine(paddedNames, colMaxes, maxW) + "\033[0m"
+	fmt.Print(truncateLine(line, maxW))
+	fmt.Print("\n")
+}
+
+func printConnection(cf connFields, colMaxes []int, maxW int, selected bool) {
+	paddedFields := make([]string, len(cf.fields))
+	for i, f := range cf.fields {
+		paddedFields[i] = padField(f, cf.fieldLens[i], colMaxes[i])
+	}
+	line := buildLine(paddedFields, colMaxes, maxW)
+	if selected {
+		fmt.Print("\033[7m")
+		fmt.Print(truncateLine(line, maxW))
+		fmt.Print("\033[0m")
+	} else {
+		fmt.Print(truncateLine(line, maxW))
+	}
+	fmt.Print("\n")
 }
 
 func display(portRanges []PortRange, firstRun bool) {
@@ -597,19 +683,40 @@ func display(portRanges []PortRange, firstRun bool) {
 	}
 	moveCursor(1, 1)
 
+	// 모든 행의 필드를 미리 계산하고 칼럼 최대 폭 산출
+	allFields := make([]connFields, len(conns))
+	for i, c := range conns {
+		allFields[i] = buildConnFields(c)
+	}
+	colMaxes := calcMaxConnColWidths(allFields)
+	maxW := cw.total - 1
+
 	if !*noHeader {
 		printHeader(*portSpec, *interval, len(conns), !*showAll, cw)
-		printTableHeader(cw)
+		printTableHeader(colMaxes, maxW)
 	}
 
-	for _, c := range conns {
-		printConnection(c, cw)
+	// selectedIdx 범위 보정
+	if selectedIdx >= len(allFields) {
+		selectedIdx = len(allFields) - 1
+	}
+	for i, cf := range allFields {
+		printConnection(cf, colMaxes, maxW, i == selectedIdx)
 		clearLine()
 	}
 
 	// Footer
 	fmt.Println()
-	fmt.Printf("  \033[90mp:pause  q:quit\033[0m")
+	if killMsg != "" && time.Since(killMsgTime) < 3*time.Second {
+		fmt.Printf("  %s", killMsg)
+	} else {
+		killMsg = ""
+		if selectedIdx >= 0 {
+			fmt.Printf("  \033[90m↑↓:select  Enter:kill  Esc:cancel  p:pause  q:quit\033[0m")
+		} else {
+			fmt.Printf("  \033[90mk:kill  p:pause  q:quit\033[0m")
+		}
+	}
 	clearLine()
 	clearToEnd()
 }
@@ -617,13 +724,48 @@ func display(portRanges []PortRange, firstRun bool) {
 func printPlainSnapshot(conns []PortInfo) {
 	cols, _ := getTerminalSize()
 	cw := calcColWidths(cols)
+
+	allFields := make([]connFields, len(conns))
+	for i, c := range conns {
+		allFields[i] = buildConnFields(c)
+	}
+	colMaxes := calcMaxConnColWidths(allFields)
+	maxW := cw.total - 1
+
 	if !*noHeader {
 		printHeader(*portSpec, *interval, len(conns), !*showAll, cw)
-		printTableHeader(cw)
+		printTableHeader(colMaxes, maxW)
 	}
-	for _, c := range conns {
-		printConnection(c, cw)
+	for _, cf := range allFields {
+		printConnection(cf, colMaxes, maxW, false)
 	}
+}
+
+func killSelected() {
+	displayMu.Lock()
+	defer displayMu.Unlock()
+	if selectedIdx < 0 || selectedIdx >= len(lastConns) {
+		return
+	}
+	c := lastConns[selectedIdx]
+	if c.PID <= 0 {
+		killMsg = fmt.Sprintf("\033[1;31mNo PID for this connection\033[0m")
+		killMsgTime = time.Now()
+		return
+	}
+	proc, err := os.FindProcess(int(c.PID))
+	if err != nil {
+		killMsg = fmt.Sprintf("\033[1;31mFailed to find PID %d: %v\033[0m", c.PID, err)
+		killMsgTime = time.Now()
+		return
+	}
+	err = proc.Kill()
+	if err != nil {
+		killMsg = fmt.Sprintf("\033[1;31mFailed to kill %s (PID %d): %v\033[0m", c.ProcessName, c.PID, err)
+	} else {
+		killMsg = fmt.Sprintf("\033[1;33mKilled %s (PID %d)\033[0m", c.ProcessName, c.PID)
+	}
+	killMsgTime = time.Now()
 }
 
 func handleExit() {
@@ -671,12 +813,17 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  watchport -n 1                 # 1초마다 갱신\n")
 		fmt.Fprintf(os.Stderr, "\nSort options: port, pid, name, proto, status\n")
 		fmt.Fprintf(os.Stderr, "\nKeys (while running):\n")
+		fmt.Fprintf(os.Stderr, "  k           프로세스 선택 모드 (kill)\n")
+		fmt.Fprintf(os.Stderr, "  ↑/↓         프로세스 선택\n")
+		fmt.Fprintf(os.Stderr, "  Enter       선택한 프로세스 종료\n")
+		fmt.Fprintf(os.Stderr, "  Esc         선택 해제\n")
 		fmt.Fprintf(os.Stderr, "  p, Space    일시정지/재개\n")
 		fmt.Fprintf(os.Stderr, "  q           종료 (마지막 스냅샷 유지)\n")
 	}
 
 	flag.Parse()
 	startTime = time.Now()
+	selectedIdx = -1
 
 	// 위치 인자로 포트 지정 가능
 	if flag.NArg() > 0 && *portSpec == "" {
@@ -724,9 +871,50 @@ func main() {
 				continue
 			}
 			switch key {
+			case KeyUp:
+				if selectedIdx >= 0 {
+					displayMu.Lock()
+					if selectedIdx > 0 {
+						selectedIdx--
+					}
+					displayMu.Unlock()
+					if atomic.LoadInt32(&paused) == 0 {
+						display(portRanges, false)
+					}
+				}
+			case KeyDown:
+				if selectedIdx >= 0 {
+					displayMu.Lock()
+					if selectedIdx < len(lastConns)-1 {
+						selectedIdx++
+					}
+					displayMu.Unlock()
+					if atomic.LoadInt32(&paused) == 0 {
+						display(portRanges, false)
+					}
+				}
+			case 27: // Esc
+				selectedIdx = -1
+				if atomic.LoadInt32(&paused) == 0 {
+					display(portRanges, false)
+				}
+			case 'k', 'K':
+				if selectedIdx < 0 {
+					selectedIdx = 0
+					if atomic.LoadInt32(&paused) == 0 {
+						display(portRanges, false)
+					}
+				}
+			case 13: // Enter
+				if selectedIdx >= 0 {
+					killSelected()
+					selectedIdx = -1
+					if atomic.LoadInt32(&paused) == 0 {
+						display(portRanges, false)
+					}
+				}
 			case 'p', 'P', ' ':
 				if atomic.CompareAndSwapInt32(&paused, 0, 1) {
-					// 일시정지: 원래 화면으로 복귀, 전체 스냅샷을 스크롤 가능한 일반 출력으로 인쇄
 					displayMu.Lock()
 					snapshot := lastConns
 					displayMu.Unlock()
@@ -734,12 +922,11 @@ func main() {
 					printPlainSnapshot(snapshot)
 					fmt.Printf("\n  \033[1;43;30m PAUSED \033[0m  \033[90mp:resume  q:quit\033[0m\n")
 				} else {
-					// 재개: 대체 화면으로 복귀, 라이브 갱신 재시작
 					atomic.StoreInt32(&paused, 0)
 					fmt.Print("\033[?1049h")
 					display(portRanges, true)
 				}
-			case 'q', 'Q', 3: // q 또는 Ctrl+C
+			case 'q', 'Q', 3:
 				handleExit()
 			}
 		}
